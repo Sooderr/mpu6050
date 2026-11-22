@@ -21,6 +21,7 @@
 
 #define MPU_ADDR      0x68U   // адрес датчика
 #define WHO_AM_I_REG  0x75U   // номер регистра «кто ты»
+#define PWR_MGMT_1_REG  0x6BU   // управление питанием
 
 uint8_t i2c_read_reg(uint8_t dev, uint8_t reg) {
 	// 1. START
@@ -60,8 +61,39 @@ uint8_t i2c_read_reg(uint8_t dev, uint8_t reg) {
 	while ((I2C1_SR1 & (1U << 6)) == 0) {
 	}   // ждать RxNE
 
-	return (uint8_t) I2C1_DR;                // забрать байт
+	uint8_t data = (uint8_t) I2C1_DR;        // забрать байт
+	while((I2C1_CR1 & (1U << 9)) != 0){}     // ждать, пока STOP отправится
+	return data;                             // вернуть байт
 }
+
+
+void i2c_write_reg(uint8_t dev, uint8_t reg, uint8_t val)
+{
+    // 1. START
+    I2C1_CR1 |= (1U << 8);
+    while((I2C1_SR1 & (1U << 0)) == 0){}   // SB
+
+    // 2. адрес + запись
+    I2C1_DR = (dev << 1);
+    while((I2C1_SR1 & (1U << 1)) == 0){}   // ADDR
+    (void)I2C1_SR1;
+    (void)I2C1_SR2;
+
+    // 3. номер регистра
+    while((I2C1_SR1 & (1U << 7)) == 0){}   // TxE
+    I2C1_DR = reg;
+
+    // 4. значение
+    while((I2C1_SR1 & (1U << 7)) == 0){}   // TxE
+    I2C1_DR = val;
+    while((I2C1_SR1 & (1U << 2)) == 0){}   // BTF: всё дошло
+
+    // 5. STOP
+    I2C1_CR1 |= (1U << 9);
+
+    while((I2C1_CR1 & (1U << 9)) != 0){}   // ждать, пока STOP отправится
+}
+
 
 int main(void) {
 
@@ -102,6 +134,12 @@ int main(void) {
 
 	volatile uint8_t who = i2c_read_reg(MPU_ADDR, WHO_AM_I_REG);
 	(void)who;
+
+	volatile uint8_t pwr_before = i2c_read_reg(MPU_ADDR, PWR_MGMT_1_REG);
+	i2c_write_reg(MPU_ADDR, PWR_MGMT_1_REG, 0x00U);   // разбудить
+	volatile uint8_t pwr_after  = i2c_read_reg(MPU_ADDR, PWR_MGMT_1_REG);
+	(void)pwr_before;
+	(void)pwr_after;
 
 	while (1) {
 	}
