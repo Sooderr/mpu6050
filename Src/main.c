@@ -1,4 +1,7 @@
 #include <stdint.h>
+#include <math.h>
+
+#define SCB_CPACR (*(volatile uint32_t*)0xE000ED88U)
 
 #define RCC_AHB1ENR   (*(volatile uint32_t*)0x40023830U)
 #define RCC_APB1ENR   (*(volatile uint32_t*)0x40023840U)
@@ -9,6 +12,19 @@
 #define GPIOB_IDR     (*(volatile uint32_t*)0x40020410U)   // НОВОЕ
 #define GPIOB_ODR     (*(volatile uint32_t*)0x40020414U)   // НОВОЕ
 #define GPIOB_AFRH    (*(volatile uint32_t*)0x40020424U)
+
+// UART
+
+#define GPIOA_MODER (*(volatile uint32_t*)0x40020000U)
+
+#define GPIOA_AFRL (*(volatile uint32_t*)0x40020020U)
+
+#define USART2_BRR (*(volatile uint32_t*)0x40004408U)
+#define USART2_CR1 (*(volatile uint32_t*)0x4000440CU)
+
+#define USART2_SR  (*(volatile uint32_t*)0x40004400U)
+#define USART2_DR  (*(volatile uint32_t*)0x40004404U)
+///////////////////
 
 #define I2C1_CR1      (*(volatile uint32_t*)0x40005400U)
 #define I2C1_CR2      (*(volatile uint32_t*)0x40005404U)
@@ -43,11 +59,58 @@
 volatile int16_t ax = 0;
 volatile int16_t ay = 0;
 volatile int16_t az = 0;
+
+volatile float roll  = 0.0f;   // крен
+volatile float pitch = 0.0f;   // тангаж
+
 volatile uint32_t i2c_errors = 0;   // сколько раз I2C сбоил
 
 volatile int16_t gx = 0;
 volatile int16_t gy = 0;
 volatile int16_t gz = 0;
+
+void uart_send_char(char c) {
+	while ((USART2_SR & (1U << 7)) == 0) {
+
+	}
+
+	USART2_DR = c;
+}
+
+void uart_send_string(const char *s) {
+
+	while (*s != '\0') {
+		uart_send_char(*s);
+		s++;
+	}
+
+}
+
+// отправить целое число как текст (например, -860 → "-860")
+void uart_send_int(int32_t n) {
+	if (n < 0) {
+		uart_send_char('-');
+		n = -n;
+	}
+
+	if (n == 0) {
+		uart_send_char('0');
+		return;
+	}
+
+	char buf[10];
+	uint32_t i = 0;
+	while (n > 0) {
+		buf[i] = '0' + (n % 10);   // последняя цифра → символ
+		n = n / 10;                // отрезать последнюю цифру
+		i++;
+	}
+
+	while (i > 0) {
+		i--;                       // сначала шаг назад
+		uart_send_char(buf[i]);    // потом отправить
+	}
+}
 
 /* ---------- ожидания с тайм-аутом ---------- */
 
@@ -223,10 +286,27 @@ void i2c_recover(void) {
 	(void) i2c_write_reg(MPU_ADDR, PWR_MGMT_1_REG, 0x00U); // НОВОЕ: снова разбудить датчик
 }
 
+
+void angles_update (void)
+{
+
+	roll  = atan2f((float)ay,(float)az) * 57.2958f;
+			pitch = atan2f((float)-ax,
+					sqrtf((float) ay * (float) ay + (float) az * (float) az)) * 57.2958f;
+}
+
 int main(void) {
+
+	SCB_CPACR |= (0xFU << 20);
+	__asm volatile ("dsb");
+	__asm volatile ("isb");
+
 	// такты
 	RCC_AHB1ENR |= (1U << 1);        // GPIOB
 	RCC_APB1ENR |= (1U << 21);       // I2C1
+
+	RCC_AHB1ENR |= (1U << 0);    // GPIOA
+	RCC_APB1ENR |= (1U << 17);   // USART2
 
 	// PB8, PB9 → AF
 	GPIOB_MODER &= ~(3U << 16);
@@ -246,6 +326,16 @@ int main(void) {
 	GPIOB_AFRH |= (4U << 0);        // PB8 = I2C1_SCL
 	GPIOB_AFRH &= ~(0xFU << 4);
 	GPIOB_AFRH |= (4U << 4);        // PB9 = I2C1_SDA
+
+	GPIOA_MODER &= ~(3U << 4);   // ластик: стереть поле PA2
+	GPIOA_MODER |= (2U << 4);   // 10 = AF
+
+	GPIOA_AFRL &= ~(0xFU << 8);
+	GPIOA_AFRL |= (7U << 8);
+
+	USART2_BRR = 139U;            // 115200 бод
+	USART2_CR1 |= (1U << 3);      // TE: передатчик
+	USART2_CR1 |= (1U << 13);     // UE: включить USART2
 
 	i2c_init();
 
@@ -267,6 +357,8 @@ int main(void) {
 	(void) wake_status;
 	(void) pwr_after;
 	(void) pwr_after_status;
+
+	uart_send_string("MPU6050 ready\r\n");
 
 	while (1) {
 		// ---- X ----
@@ -308,7 +400,7 @@ int main(void) {
 				&& i2c_read_reg(MPU_ADDR, GYRO_XOUT_L, &gxl) == 0) {
 			gx = (int16_t) ((gxh << 8) | gxl);
 		} else {
-			i2c_errors++;            // сбой → считаем, ax не трогаем
+			i2c_errors++;            // сбой → считаем, gx не трогаем
 			i2c_recover();
 		}
 
@@ -318,7 +410,7 @@ int main(void) {
 				&& i2c_read_reg(MPU_ADDR, GYRO_YOUT_L, &gyl) == 0) {
 			gy = (int16_t) ((gyh << 8) | gyl);
 		} else {
-			i2c_errors++;            // сбой → считаем, ax не трогаем
+			i2c_errors++;            // сбой → считаем, gy не трогаем
 			i2c_recover();
 		}
 
@@ -328,8 +420,43 @@ int main(void) {
 				&& i2c_read_reg(MPU_ADDR, GYRO_ZOUT_L, &gzl) == 0) {
 			gz = (int16_t) ((gzh << 8) | gzl);
 		} else {
-			i2c_errors++;            // сбой → считаем, ax не трогаем
+			i2c_errors++;            // сбой → считаем, gz не трогаем
 			i2c_recover();
 		}
+
+
+	    angles_update();
+
+		// ---- ТЕЛЕМЕТРИЯ ----
+		uart_send_string("ax=");
+		uart_send_int(ax);
+		uart_send_string(" ay=");
+		uart_send_int(ay);
+		uart_send_string(" az=");
+		uart_send_int(az);
+		uart_send_string(" gx=");
+		uart_send_int(gx);
+		uart_send_string(" gy=");
+		uart_send_int(gy);
+		uart_send_string(" gz=");
+		uart_send_int(gz);
+
+		uart_send_string(" roll=");
+		uart_send_int((int32_t) roll);
+
+		uart_send_string(" pitch=");
+		uart_send_int((int32_t) pitch);
+
+
+
+
+
+
+		uart_send_string(" err=");
+		uart_send_int((int32_t) i2c_errors);
+		uart_send_string("\r\n");
+
+		for (volatile uint32_t d = 0; d < 300000U; d++) {
+		}   // пауза: ~5-10 строк в секунду
 	}
 }
